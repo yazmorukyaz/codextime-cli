@@ -1,0 +1,37 @@
+{
+  "name": "codextime",
+  "version": "0.2.0",
+  "description": "Official CLI for syncing Codex usage metadata to Codextime",
+  "homepage": "https://codexti.me",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yazmorukyaz/codextime-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yazmorukyaz/codextime-cli/issues"
+  },
+  "bin": {
+    "codextime": "dist/index.js"
+  },
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.js"
+  },
+  "files": [
+    "dist",
+    "example-events.json",
+    "example-usage.json",
+    "README.md",
+    "PRIVACY.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@codextime/types": "^0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

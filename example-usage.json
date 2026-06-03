@@ -1,0 +1,32 @@
+{
+  "metadata": {
+    "source": "example"
+  },
+  "daily": [
+    {
+      "date": "2025-06-24",
+      "provider": "codex",
+      "ide": "vscode",
+      "sessionId": "demo-session",
+      "inputTokens": 1000,
+      "outputTokens": 2200,
+      "reasoningTokens": 150,
+      "toolTokens": 30,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "totalCost": 0.0253,
+      "modelsUsed": ["gpt-5-codex"],
+      "modelBreakdowns": [
+        {
+          "modelName": "gpt-5-codex",
+          "provider": "codex",
+          "inputTokens": 1000,
+          "outputTokens": 2200,
+          "reasoningTokens": 150,
+          "toolTokens": 30,
+          "cost": 0.0253
+        }
+      ]
+    }
+  ]
+}
