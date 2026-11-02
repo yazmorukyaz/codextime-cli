@@ -151,6 +151,8 @@ export async function runAutomaticSync(options: AutomaticOptions, existing?: Syn
     do {
       try {
         const sources = await discoverSessionSources(options.homes)
+        if (sources.skipped)
+          console.warn(`${sources.skipped} unreadable or ambiguous sources were excluded.`)
         let items: SessionSnapshot[] = []
         if (
           sources.files.length &&

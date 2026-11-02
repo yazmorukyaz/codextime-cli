@@ -637,7 +637,7 @@ function withInstallationProvenance(payload: UsageRequestPayload): UsageRequestP
   const installationId = readFileSync(installationPath, 'utf8').trim()
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(installationId)) throw new Error('Invalid installation identity; refusing an unattributed upload.')
   const coverage = payload.data.metadata?.source === 'ccusage-codex-daily' ? 'retained-local-logs' : 'manual-input'
-  const provenance = { installationId, importerVersion: '0.5.0', coverage, missingLogs: 'unknown', cloudCoverage: 'not-included' }
+  const provenance = { installationId, importerVersion: '0.5.1', coverage, missingLogs: 'unknown', cloudCoverage: 'not-included' }
   return {
     ...payload,
     data: {

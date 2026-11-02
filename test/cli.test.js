@@ -54,7 +54,7 @@ describe('codextime CLI safety behavior', () => {
       const metadata = payloads.map(payload => payload.data.daily[0].modelBreakdowns[0].metadata)
       assert.equal(metadata[0].installationId, metadata[1].installationId)
       assert.notEqual(metadata[0].installationId, metadata[2].installationId)
-      assert.equal(metadata[0].importerVersion, '0.5.0')
+      assert.equal(metadata[0].importerVersion, '0.5.1')
       assert.equal(metadata[0].cloudCoverage, 'not-included')
     } finally { await new Promise(resolve => server.close(resolve)) }
   })

@@ -94,6 +94,7 @@ test('plain/archived/compressed copies follow source precedence and duplicate id
     for (const folder of ['sessions', 'archived_sessions']) mkdirSync(join(root, folder))
     const text = JSON.stringify({ type: 'session_meta', payload: { id, cwd: root } }) + '\n'
     writeFileSync(join(root, 'sessions', 'same.jsonl'), text)
+    writeFileSync(join(root, 'sessions', 'corrupt.jsonl.zst'), 'not a zstd stream')
     writeFileSync(join(root, 'archived_sessions', 'same.jsonl'), text)
     if (zlib.zstdCompressSync)
       writeFileSync(
@@ -101,6 +102,7 @@ test('plain/archived/compressed copies follow source precedence and duplicate id
         zlib.zstdCompressSync(Buffer.from(text))
       )
     assert.equal((await discoverSessionSources([root])).files.length, 1)
+    assert.equal((await discoverSessionSources([root])).skipped, 1)
     writeFileSync(join(root, 'sessions', 'second.jsonl'), text)
     const report = {
       session: [
@@ -179,6 +181,7 @@ test('pinned engine computes a fixed post-cutover window rather than lifetime to
       join(root, 'sessions', 'source.jsonl'),
       records.map((row) => JSON.stringify(row)).join('\n') + '\n'
     )
+    writeFileSync(join(root,'sessions','bad.jsonl.zst'),'not compressed')
     const output = execFileSync(
       process.execPath,
       [

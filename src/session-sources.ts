@@ -87,6 +87,7 @@ async function header(file: string) {
   return null
 }
 export async function discoverSessionSources(homes: string[]) {
+  let skipped = 0
   const files = new Map<string, { file: string; period: string; expectedId: string | null }>()
   const signature = createHash('sha256')
   for (const home of homes) {
@@ -101,9 +102,12 @@ export async function discoverSessionSources(homes: string[]) {
     if (!roots.length) roots.push(home)
     const chosen = new Map<string, { file: string; period: string }>()
     async function walk(root: string, directory: string) {
-      const entries = (await readdir(directory, { withFileTypes: true })).sort((a, b) =>
-        a.name.localeCompare(b.name)
-      )
+      const entries = (
+        await readdir(directory, { withFileTypes: true }).catch(() => {
+          skipped++
+          return []
+        })
+      ).sort((a, b) => a.name.localeCompare(b.name))
       for (const entry of entries) {
         const file = resolve(directory, entry.name)
         if (entry.isDirectory()) await walk(root, file)
@@ -118,12 +122,21 @@ export async function discoverSessionSources(homes: string[]) {
     }
     for (const root of roots) await walk(root, root)
     for (const value of chosen.values()) {
-      const info = await stat(value.file)
-      signature.update(value.file + '\0' + info.size + '\0' + info.mtimeMs)
-      files.set(value.file, { ...value, expectedId: (await header(value.file))?.id ?? null })
+      try {
+        const info = await stat(value.file)
+        signature.update(value.file + '\0' + info.size + '\0' + info.mtimeMs)
+        const metadata = await header(value.file)
+        if (!metadata) {
+          skipped++
+          continue
+        }
+        files.set(value.file, { ...value, expectedId: metadata.id })
+      } catch {
+        skipped++
+      }
     }
   }
-  return { files: [...files.values()], signature: signature.digest('hex') }
+  return { files: [...files.values()], signature: signature.digest('hex'), skipped }
 }
 export async function sessionSnapshots(
   report: unknown,
@@ -141,7 +154,7 @@ export async function sessionSnapshots(
     byId = new Map<string, Source[]>()
   let skipped = 0
   for (const file of files) {
-    const metadata = await header(file.file)
+    const metadata = await header(file.file).catch(() => null)
     if (!metadata || ('expectedId' in file && metadata.id !== file.expectedId)) {
       skipped++
       continue
@@ -163,26 +176,31 @@ export async function sessionSnapshots(
     const source = candidates[0]
     const cwds = new Set<string>(source.cwd ? [source.cwd] : [])
     let ambiguous = false
-    for await (const line of lines(source.file)) {
-      if (!line) {
-        ambiguous = true
-        continue
-      }
-      if (!line.includes('turn_context') && !line.includes('session_meta')) continue
-      try {
-        const record = JSON.parse(line)
-        if (
-          ['turn_context', 'session_meta'].includes(record.type) &&
-          typeof record.payload?.cwd === 'string'
-        )
-          cwds.add(record.payload.cwd)
-        if (cwds.size > 256) {
+    try {
+      for await (const line of lines(source.file)) {
+        if (!line) {
           ambiguous = true
-          break
+          continue
         }
-      } catch {
-        ambiguous = true
+        if (!line.includes('turn_context') && !line.includes('session_meta')) continue
+        try {
+          const record = JSON.parse(line)
+          if (
+            ['turn_context', 'session_meta'].includes(record.type) &&
+            typeof record.payload?.cwd === 'string'
+          )
+            cwds.add(record.payload.cwd)
+          if (cwds.size > 256) {
+            ambiguous = true
+            break
+          }
+        } catch {
+          ambiguous = true
+        }
       }
+    } catch {
+      skipped++
+      continue
     }
     const projects: SessionProject[] = []
     const recorded = source.remote ? remoteProject(source.remote) : null
