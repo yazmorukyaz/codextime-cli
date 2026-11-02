@@ -11,7 +11,7 @@ import { calculateModelTotalTokens, isValidUsageRequest } from '../dist/usage-pa
 
 const testDir = dirname(fileURLToPath(import.meta.url))
 const packageDir = resolve(testDir, '..')
-const repoDir = packageDir
+const repoDir = resolve(packageDir, '..', '..')
 const cliPath = resolve(packageDir, 'dist', 'index.js')
 const exampleUsage = resolve(packageDir, 'example-usage.json')
 const safetyHome = mkdtempSync(resolve(tmpdir(), 'codextime-safety-home-'))
@@ -54,7 +54,7 @@ describe('codextime CLI safety behavior', () => {
       const metadata = payloads.map(payload => payload.data.daily[0].modelBreakdowns[0].metadata)
       assert.equal(metadata[0].installationId, metadata[1].installationId)
       assert.notEqual(metadata[0].installationId, metadata[2].installationId)
-      assert.equal(metadata[0].importerVersion, '0.4.1')
+      assert.equal(metadata[0].importerVersion, '0.5.0')
       assert.equal(metadata[0].cloudCoverage, 'not-included')
     } finally { await new Promise(resolve => server.close(resolve)) }
   })

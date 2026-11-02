@@ -29,6 +29,26 @@ Prefer `codextime login` for normal use so tokens are not pasted into shell hist
 
 ## Accounting and Coverage
 
+### Automatic projects and cross-device tracking (0.5)
+
+Run on each computer using the same Codextime account:
+
+```bash
+npx codextime@latest login
+npx codextime@latest preview --automatic
+npx codextime@latest watch
+```
+
+`watch` explicitly enrolls the account and syncs every five minutes while running. Stop with Ctrl+C. No background service is installed. Use `sync --automatic` for one run, `--device-name "Work Mac"` for a label, or `--interval 120` for a different interval (60-3600 seconds).
+
+Enrollment selects a clean UTC start day after existing imported history. If today already has imported usage, tracking starts tomorrow. Existing rows are never overwritten, relabeled, or replayed. Legacy uploads are frozen after enrollment: upgrade every installation to 0.5 or newer. New tracking appears separately from imported history and does not repair missing old logs.
+
+The same session/model observed on multiple computers is counted once. Advancing snapshots add only component deltas; conflicts are held, not summed. Git remote identities are normalized and hashed locally to match projects across computers. Raw remote addresses and paths are not uploaded. Local-only folders receive separate persistent identities; sessions spanning multiple repositories remain unassigned.
+
+Only accessible local logs are covered. Cloud tasks and other computers are not discovered remotely. Ambiguous session identities are skipped. Compressed logs require Node.js 22.15 or newer. Automatic tracking does not calculate costs, approve leaderboard rankings, or publish journal entries.
+
+### Legacy Daily Imports
+
 Version 0.4 uses pinned ccusage 20.0.47 and its per-agent model breakdowns. It selects Codex entries locally, retains model names as reported, and preserves per-model estimated prices rather than dividing a daily price by token share. Models without a known price remain explicitly marked as unpriced; a zero placeholder does not mean free usage.
 
 Only completed UTC days are uploaded. Today's usage remains local until the day closes. The first sync and `--force` inspect retained local history, but do not authorize overwriting existing records. Identical retries from the same installation are no-ops; changed counters, unknown-device history, and overlapping sources are rejected for review. A random installation ID and importer version accompany new uploads. Reports use UTC and large histories are sent in bounded batches. Multi-device daily totals are not automatically merged because retained logs can overlap.

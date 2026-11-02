@@ -8,6 +8,10 @@ Automatic imports use ccusage's unified per-agent report, which may inspect meta
 
 ## Uploaded
 
+Automatic session tracking additionally sends project display names, hashed normalized Git identities (or random local-folder identities), the fixed tracking start day, component counters, and an optional installation label. Git hashes are stable identifiers, not anonymization of public repository names. Raw Git addresses, credentials, and working directories remain local. Local project identities are stored under `~/.codextime/project-identities`.
+
+Enrollment freezes legacy imports and starts a separate tracking window without modifying existing usage. `watch` runs only while its foreground process is running; no system service is installed.
+
 - token counts
 - model names
 - timestamps

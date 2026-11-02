@@ -1,6 +1,6 @@
 {
   "name": "codextime",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Official CLI for syncing Codex usage metadata to Codextime",
   "homepage": "https://codexti.me",
   "repository": {

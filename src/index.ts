@@ -9,6 +9,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { CCUSAGE_VERSION, normalizeCodexDailyReport } from './ccusage-report.js'
 import { partitionUpload } from './upload-batches.js'
+import { automaticAccount, runAutomaticSync } from './automatic-sync.js'
 import {
   UsageRequestPayload,
   UsageDataPayload,
@@ -19,7 +20,7 @@ import {
 } from './usage-payload.js'
 
 interface CliOptions {
-  command: 'preview' | 'login' | 'sync' | 'doctor' | 'legacy-sync'
+  command: 'preview' | 'login' | 'sync' | 'watch' | 'doctor' | 'legacy-sync'
   userId?: string
   uploadToken?: string
   inputPath?: string
@@ -27,6 +28,9 @@ interface CliOptions {
   verbose: boolean
   forceUpload: boolean
   fromCodex: boolean
+  automatic?: boolean
+  interval?: number
+  deviceName?: string
 }
 
 interface LogEvent {
@@ -102,6 +106,13 @@ Usage:
   codextime login [--token ctu_live_...] [--api https://example.com]
   codextime sync [--input codextime-usage.json] [--api https://example.com] [--force] [--verbose]
   codextime doctor [--api https://example.com]
+  codextime preview --automatic
+  codextime sync --automatic [--device-name "Work laptop"]
+  codextime watch [--interval 300] [--device-name "Work laptop"]
+
+Automatic mode detects session projects locally and deduplicates copied sessions across devices.
+First enrollment freezes legacy uploads and selects a clean UTC tracking boundary.
+Run the new CLI on each computer. Watch runs in the foreground until stopped; no service is installed.
 
 Legacy migration:
   codextime <userId> [--input codextime-usage.json] [--api https://example.com] [--force] [--verbose]
@@ -229,7 +240,7 @@ function parseArgs(argv: string[]): CliOptions | null {
   }
 
   const firstArg = argv[0]
-  const command = ['preview', 'login', 'sync', 'doctor'].includes(firstArg)
+  const command = ['preview', 'login', 'sync', 'watch', 'doctor'].includes(firstArg)
     ? firstArg as CliOptions['command']
     : 'legacy-sync'
 
@@ -245,6 +256,16 @@ function parseArgs(argv: string[]): CliOptions | null {
     getFlagValue(argv, '--token') ??
     process.env.CODEXTIME_UPLOAD_TOKEN ??
     config.uploadToken
+
+  const automatic = argv.includes('--automatic') || command === 'watch'
+  const interval = Number(getFlagValue(argv, '--interval') ?? 300)
+  const deviceName = getFlagValue(argv, '--device-name')
+  if (!Number.isSafeInteger(interval) || interval < 60 || interval > 3600) throw Error('Watch interval must be an integer from 60 to 3600 seconds')
+  if (deviceName !== undefined && (!deviceName.trim() || deviceName.length > 80 || /[\x00-\x1f\x7f/\\]/.test(deviceName))) throw Error('Invalid device name')
+  if (automatic) {
+    if (argv.includes('--input') || process.env.CODEXTIME_USAGE_FILE) throw Error('Automatic sync uses Codex logs, not manual input files')
+    return { command, uploadToken, apiBaseUrl, verbose, forceUpload, fromCodex: true, automatic, interval, deviceName }
+  }
 
   if (command === 'login' || command === 'doctor') {
     return {
@@ -616,7 +637,7 @@ function withInstallationProvenance(payload: UsageRequestPayload): UsageRequestP
   const installationId = readFileSync(installationPath, 'utf8').trim()
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(installationId)) throw new Error('Invalid installation identity; refusing an unattributed upload.')
   const coverage = payload.data.metadata?.source === 'ccusage-codex-daily' ? 'retained-local-logs' : 'manual-input'
-  const provenance = { installationId, importerVersion: '0.4.1', coverage, missingLogs: 'unknown', cloudCoverage: 'not-included' }
+  const provenance = { installationId, importerVersion: '0.5.0', coverage, missingLogs: 'unknown', cloudCoverage: 'not-included' }
   return {
     ...payload,
     data: {
@@ -788,6 +809,16 @@ async function main() {
   if (options.command === 'doctor') {
     await runDoctor(options)
     return
+  }
+
+  if (options.automatic || (options.command === 'sync' && options.fromCodex && options.uploadToken)) {
+    const account = options.uploadToken && !options.automatic ? await automaticAccount(options.apiBaseUrl, options.uploadToken) : null
+    if (options.automatic || account) {
+      await runAutomaticSync({ apiBaseUrl: options.apiBaseUrl, token: options.uploadToken, configDir: CODEXTIME_CONFIG_DIR,
+        homes: (process.env.CODEX_HOME || resolve(HOME_DIRECTORY, '.codex')).split(',').map(home => resolve(home.trim())),
+        enroll: Boolean(options.automatic), preview: options.command === 'preview', watch: options.command === 'watch', interval: options.interval || 300, deviceName: options.deviceName }, account || undefined)
+      return
+    }
   }
 
   if (options.verbose) {
