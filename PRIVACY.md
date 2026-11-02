@@ -2,6 +2,10 @@
 
 Codextime CLI is designed to collect usage metadata, not your work.
 
+Automatic imports use ccusage's unified per-agent report, which may inspect metadata from other coding agents on your machine. Codextime selects only Codex entries before building an upload. Other-agent entries, raw local paths, prompts, responses, and source files are not included in automatic imports.
+
+`preview` does not upload usage. Installing the pinned engine and fetching public pricing data can make network requests. Manual input files may contain optional metadata supplied by you; do not put secrets in those files.
+
 ## Uploaded
 
 - token counts
@@ -10,6 +14,9 @@ Codextime CLI is designed to collect usage metadata, not your work.
 - session IDs
 - optional usage metadata
 - estimated API-equivalent cost
+- random installation ID, importer version, and source coverage labels
+
+The installation ID is created at first sync in `~/.codextime/installation-id`. It is not a hardware identifier. Copying this file to another computer also copies its identity; separate installations should not share it. Historical records are not retroactively assigned a device.
 
 ## Not Uploaded
 

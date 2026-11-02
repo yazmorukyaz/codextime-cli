@@ -1,12 +1,14 @@
 #!/usr/bin/env node
-import { readFile, readdir } from 'node:fs/promises'
-import { chmodSync, createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { resolve, dirname, join } from 'node:path'
+import { readFile } from 'node:fs/promises'
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { homedir } from 'node:os'
 import process from 'node:process'
+import { randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { createInterface } from 'node:readline'
+import { CCUSAGE_VERSION, normalizeCodexDailyReport } from './ccusage-report.js'
+import { partitionUpload } from './upload-batches.js'
 import {
   UsageRequestPayload,
   UsageDataPayload,
@@ -14,7 +16,7 @@ import {
   ModelBreakdownPayload,
   isValidUsageRequest,
   Provider
-} from '@codextime/types'
+} from './usage-payload.js'
 
 interface CliOptions {
   command: 'preview' | 'login' | 'sync' | 'doctor' | 'legacy-sync'
@@ -57,28 +59,13 @@ interface RateLimitsSnapshot {
   secondary?: RateLimitWindow
 }
 
-const CODEX_PRICING = {
-  inputPerToken: 1.25 / 1_000_000,
-  cachedInputPerToken: 0.125 / 1_000_000,
-  outputPerToken: 10 / 1_000_000,
-  docsUrl: 'https://developers.openai.com/codex/pricing/'
-} as const
+const CCUSAGE_PACKAGE = `ccusage@${CCUSAGE_VERSION}`
 
 const execFileAsync = promisify(execFile)
 
 function estimateCodexCost(event: LogEvent) {
-  const inputTokens = event.inputTokens ?? 0
-  const cachedTokens = event.cacheReadTokens ?? 0
-  const outputTokens =
-    (event.outputTokens ?? 0) +
-    (event.reasoningTokens ?? 0) +
-    (event.toolTokens ?? 0)
-
-  return (
-    inputTokens * CODEX_PRICING.inputPerToken +
-    cachedTokens * CODEX_PRICING.cachedInputPerToken +
-    outputTokens * CODEX_PRICING.outputPerToken
-  )
+  if (event.cost === undefined) throw new Error('Manual event imports require an explicit cost; automatic model pricing is available through --from-codex.')
+  return event.cost
 }
 
 const DEFAULT_INPUT_FILENAME = 'codextime-usage.json'
@@ -466,9 +453,7 @@ function aggregateEventsToUsage(events: LogEvent[], provider: Provider): UsageDa
       inputTokens +
       outputTokens +
       cacheCreationTokens +
-      cacheReadTokens +
-      reasoningTokens +
-      toolTokens
+      cacheReadTokens
 
     accumulator.tokens.input += inputTokens
     accumulator.tokens.output += outputTokens
@@ -524,9 +509,7 @@ function aggregateEventsToUsage(events: LogEvent[], provider: Provider): UsageDa
         day.tokens.input +
         day.tokens.output +
         day.tokens.cacheCreation +
-        day.tokens.cacheRead +
-        day.tokens.reasoning +
-        day.tokens.tool
+        day.tokens.cacheRead
 
       return {
         date: day.date,
@@ -581,17 +564,6 @@ async function loadUsageData(filePath: string, provider: Provider): Promise<Usag
   return aggregateEventsToUsage(logEvents, provider)
 }
 
-function extractLatestRateLimits(payload: UsageDataPayload | null): RateLimitsSnapshot | null {
-  if (!payload?.daily?.length) return null
-  for (let i = payload.daily.length - 1; i >= 0; i--) {
-    const entry = payload.daily[i]
-    if (entry?.metadata && 'rateLimits' in entry.metadata && entry.metadata.rateLimits) {
-      return entry.metadata.rateLimits as RateLimitsSnapshot
-    }
-  }
-  return null
-}
-
 function formatDayForCcusage(day: string | null): string | null {
   if (!day) return null
   if (day.includes('-')) return day
@@ -622,479 +594,49 @@ function computeCcusageWindow(lastCursorDay: string | null): string {
   return fallback.toISOString().split('T')[0]
 }
 
-async function loadUsageFromCcusage(
-  sinceDay: string | null,
-  provider: Provider,
-  verbose: boolean,
-  latestRateLimits?: RateLimitsSnapshot | null
-): Promise<UsageDataPayload | null> {
+async function loadUsageFromCcusage(sinceDay: string | null, verbose: boolean): Promise<UsageDataPayload> {
+  const args = ['--yes', CCUSAGE_PACKAGE, 'daily', '--json', '--by-agent', '--timezone', 'UTC']
+  if (sinceDay) args.push('--since', computeCcusageWindow(sinceDay))
+  if (verbose) console.log('Reading Codex-only usage from ccusage per-agent model breakdowns.')
   try {
-    const sinceArg = computeCcusageWindow(sinceDay)
-    const args = ['--yes', 'ccusage', 'daily', '--json', '--since', sinceArg]
-    if (verbose) {
-      console.log(`Fetching Codex usage via ccusage (since ${sinceArg})...`)
-    }
-    const { stdout } = await execFileAsync('npx', args, { maxBuffer: 10 * 1024 * 1024 })
-    const report = JSON.parse(stdout) as {
-      daily?: Array<{
-        date?: string
-        period?: string
-        inputTokens?: number
-        cachedInputTokens?: number
-        cacheReadTokens?: number
-        cacheCreationTokens?: number
-        outputTokens?: number
-        reasoningOutputTokens?: number
-        reasoningTokens?: number
-        totalTokens?: number
-        costUSD?: number
-        totalCost?: number
-        modelsUsed?: string[]
-        modelBreakdowns?: Array<{
-          modelName: string
-          inputTokens?: number
-          cachedInputTokens?: number
-          cacheReadTokens?: number
-          cacheCreationTokens?: number
-          outputTokens?: number
-          reasoningOutputTokens?: number
-          reasoningTokens?: number
-          totalTokens?: number
-          cost?: number
-          costUSD?: number
-        }>
-        models?: Record<string, {
-          inputTokens?: number
-          cachedInputTokens?: number
-          cacheReadTokens?: number
-          outputTokens?: number
-          reasoningOutputTokens?: number
-          reasoningTokens?: number
-          totalTokens?: number
-          isFallback?: boolean
-        }>
-      }>
-    }
-
-    if (!report?.daily || report.daily.length === 0) {
-      if (verbose) {
-        console.log('ccusage returned no usage data.')
-      }
-      return null
-    }
-
-    const daily = report.daily.map(entry => {
-      const entryDate = entry.date ?? entry.period
-      if (!entryDate) {
-        throw new Error('ccusage entry missing date/period')
-      }
-      const parsedDate = new Date(`${entryDate}T00:00:00Z`)
-      if (Number.isNaN(parsedDate.getTime())) {
-        throw new Error(`Invalid ccusage date: ${entryDate}`)
-      }
-      const isoDate = parsedDate.toISOString().split('T')[0]
-      const totalCost = entry.costUSD ?? entry.totalCost ?? 0
-      const models = entry.modelBreakdowns
-        ? Object.fromEntries(entry.modelBreakdowns.map(model => [model.modelName, model]))
-        : entry.models || {}
-      const modelBreakdowns: ModelBreakdownPayload[] = Object.entries(models).map(([modelName, stats]) => {
-        const cacheReadTokens = stats.cacheReadTokens ?? stats.cachedInputTokens ?? 0
-        const reasoningTokens = stats.reasoningTokens ?? stats.reasoningOutputTokens ?? 0
-        const totalTokens = stats.totalTokens ?? (
-          (stats.inputTokens ?? 0) +
-          cacheReadTokens +
-          (stats.outputTokens ?? 0) +
-          reasoningTokens
-        )
-        const share = entry.totalTokens && entry.totalTokens > 0
-          ? totalTokens / entry.totalTokens
-          : 1
-        const costShare = stats.cost ?? stats.costUSD ?? (totalCost * share)
-
-        return {
-          modelName,
-          provider,
-          inputTokens: stats.inputTokens ?? 0,
-          outputTokens: stats.outputTokens ?? 0,
-          cacheCreationTokens: stats.cacheCreationTokens ?? 0,
-          cacheReadTokens,
-          reasoningTokens,
-          toolTokens: 0,
-          cost: costShare,
-          totalTokens
-        }
-      })
-
-      const modelsUsed = entry.modelsUsed ?? Object.keys(models)
-      const totalTokens = entry.totalTokens ?? (
-        (entry.inputTokens ?? 0) +
-        (entry.cacheReadTokens ?? entry.cachedInputTokens ?? 0) +
-        (entry.outputTokens ?? 0) +
-        (entry.reasoningTokens ?? entry.reasoningOutputTokens ?? 0)
-      )
-
-      const metadata: Record<string, unknown> = { source: 'ccusage-codex' }
-
-      return {
-        date: isoDate,
-        provider,
-        ide: 'codex-ccusage',
-        sessionId: undefined,
-        inputTokens: entry.inputTokens ?? 0,
-        outputTokens: entry.outputTokens ?? 0,
-        cacheCreationTokens: entry.cacheCreationTokens ?? 0,
-        cacheReadTokens: entry.cacheReadTokens ?? entry.cachedInputTokens ?? 0,
-        reasoningTokens: entry.reasoningTokens ?? entry.reasoningOutputTokens ?? 0,
-        toolTokens: 0,
-        totalTokens,
-        totalCost,
-        modelsUsed,
-        modelBreakdowns,
-        metadata
-      }
-    })
-
-    if (latestRateLimits && daily.length > 0) {
-      const lastEntry = daily[daily.length - 1]
-      lastEntry.metadata = {
-        ...(lastEntry.metadata || {}),
-        rateLimits: latestRateLimits
-      }
-    }
-
-    return {
-      provider,
-      metadata: { source: 'ccusage-codex' },
-      daily
-    }
-  } catch (error) {
-    console.error('Failed to fetch usage via ccusage:', error)
-    return null
-  }
-}
-
-const CODEX_SESSIONS_SUBPATH = 'sessions'
-
-interface CodexSessionTotals {
-  input_tokens: number
-  cached_input_tokens: number
-  output_tokens: number
-  reasoning_output_tokens: number
-  total_tokens: number
-}
-
-async function loadUsageFromCodex(
-  lastUpdateTimestamp: string | null,
-  verbose: boolean
-): Promise<UsageDataPayload> {
-  const events = await collectCodexSessions(lastUpdateTimestamp, verbose)
-
-  if (!events.length) {
-    if (verbose) {
-      console.log('No Codex sessions found after the previous cursor.')
-    }
-    return {
-      provider: 'codex',
-      metadata: { source: 'codex-sessions' },
-      daily: []
-    }
-  }
-
-  const daily: DailyUsagePayload[] = events.map(event => {
-    const totalTokens =
-      event.totalTokens ??
-      (event.inputTokens ?? 0) +
-        (event.cacheReadTokens ?? 0) +
-        (event.outputTokens ?? 0) +
-        (event.reasoningTokens ?? 0) +
-        (event.toolTokens ?? 0)
-
-    const cost = event.cost ?? estimateCodexCost(event)
-
-    return {
-      date: event.timestamp,
-      provider: 'codex',
-      ide: event.ide ?? 'codex-cli',
-      sessionId: event.sessionId,
-      inputTokens: event.inputTokens ?? 0,
-      outputTokens: event.outputTokens ?? 0,
-      cacheCreationTokens: 0,
-      cacheReadTokens: event.cacheReadTokens ?? 0,
-      reasoningTokens: event.reasoningTokens ?? 0,
-      toolTokens: event.toolTokens ?? 0,
-      totalTokens,
-      totalCost: cost,
-      modelsUsed: [event.model],
-      modelBreakdowns: [
-        {
-          modelName: event.model,
-          provider: 'codex',
-          inputTokens: event.inputTokens ?? 0,
-          outputTokens: event.outputTokens ?? 0,
-          cacheCreationTokens: 0,
-          cacheReadTokens: event.cacheReadTokens ?? 0,
-          reasoningTokens: event.reasoningTokens ?? 0,
-          toolTokens: event.toolTokens ?? 0,
-          cost,
-          ide: event.ide,
-          sessionId: event.sessionId,
-          metadata: event.metadata
-        }
-      ],
-      metadata: event.metadata
-    }
-  })
-
-  return {
-    provider: 'codex',
-    metadata: { source: 'codex-sessions' },
-    daily
-  }
-}
-
-async function collectCodexSessions(lastUpdateTimestamp: string | null, verbose: boolean) {
-  const codexHome = CODEX_HOME_PATH()
-  const sessionsRoot = join(codexHome, CODEX_SESSIONS_SUBPATH)
-
-  if (!existsSync(sessionsRoot)) {
-    throw new Error(`Codex sessions directory not found at ${sessionsRoot}. Run Codex at least once before using --from-codex.`)
-  }
-
-  const sinceEpoch = lastUpdateTimestamp ? Date.parse(lastUpdateTimestamp) : null
-  if (lastUpdateTimestamp && Number.isNaN(sinceEpoch)) {
-    throw new Error(`Invalid last update timestamp: ${lastUpdateTimestamp}`)
-  }
-
-  const files = await listSessionFiles(sessionsRoot, sinceEpoch)
-  if (verbose) {
-    console.log(`Scanning ${files.length} Codex session file${files.length === 1 ? '' : 's'}...`)
-  }
-
-  const events: LogEvent[] = []
-
-  for (const filePath of files) {
-    const event = await parseSessionFile(filePath, sinceEpoch, sessionsRoot)
-    if (event) {
-      events.push(event)
-    }
-  }
-
-  return events.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-}
-
-async function listSessionFiles(root: string, sinceEpoch: number | null): Promise<string[]> {
-  const results: string[] = []
-  const years = await safeReadDir(root)
-  const sinceDayStart = sinceEpoch ? startOfDayUtc(sinceEpoch) : null
-
-  for (const year of years.filter(isYearDirectory).sort()) {
-    const yearPath = join(root, year)
-    const months = await safeReadDir(yearPath)
-
-    for (const month of months.filter(isMonthDirectory).sort()) {
-      const monthPath = join(yearPath, month)
-      const days = await safeReadDir(monthPath)
-
-      for (const day of days.filter(isDayDirectory).sort()) {
-        const dayPath = join(monthPath, day)
-        const dayEpoch = Date.parse(`${year}-${month}-${day}T00:00:00Z`)
-        if (sinceDayStart && !Number.isNaN(dayEpoch) && dayEpoch < sinceDayStart) {
-          continue
-        }
-
-        const sessionFiles = await safeReadDir(dayPath)
-        sessionFiles
-          .filter(name => name.endsWith('.jsonl'))
-          .sort()
-          .forEach(file => results.push(join(dayPath, file)))
-      }
-    }
-  }
-
-  return results
-}
-
-async function safeReadDir(path: string): Promise<string[]> {
-  try {
-    return await readdir(path)
+    const { stdout } = await execFileAsync('npx', args, { maxBuffer: 50 * 1024 * 1024, timeout: 120000 })
+    return normalizeCodexDailyReport(JSON.parse(stdout))
   } catch {
-    return []
+    throw new Error('Unable to read reliable Codex usage from ccusage. No fallback totals were generated.')
   }
 }
 
-function isYearDirectory(name: string) {
-  return /^\d{4}$/.test(name)
-}
-
-function isMonthDirectory(name: string) {
-  return /^\d{2}$/.test(name)
-}
-
-function isDayDirectory(name: string) {
-  return /^\d{2}$/.test(name)
-}
-
-function startOfDayUtc(epoch: number) {
-  const date = new Date(epoch)
-  date.setUTCHours(0, 0, 0, 0)
-  return date.getTime()
-}
-
-function normalizeRateLimits(raw: any): RateLimitsSnapshot {
-  const snapshot: RateLimitsSnapshot = {}
-  if (raw?.primary) {
-    snapshot.primary = {
-      usedPercent: Number(raw.primary.used_percent ?? raw.primary.usedPercent ?? 0),
-      windowMinutes: Number(raw.primary.window_minutes ?? raw.primary.windowMinutes ?? 0),
-      resetsAt: Number(raw.primary.resets_at ?? raw.primary.resetsAt ?? 0)
-    }
+function withInstallationProvenance(payload: UsageRequestPayload): UsageRequestPayload {
+  const installationPath = resolve(CODEXTIME_CONFIG_DIR, 'installation-id')
+  mkdirSync(CODEXTIME_CONFIG_DIR, { recursive: true, mode: 0o700 })
+  if (!existsSync(installationPath)) {
+    try { writeFileSync(installationPath, randomUUID(), { mode: 0o600, flag: 'wx' }) }
+    catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error }
   }
-  if (raw?.secondary) {
-    snapshot.secondary = {
-      usedPercent: Number(raw.secondary.used_percent ?? raw.secondary.usedPercent ?? 0),
-      windowMinutes: Number(raw.secondary.window_minutes ?? raw.secondary.windowMinutes ?? 0),
-      resetsAt: Number(raw.secondary.resets_at ?? raw.secondary.resetsAt ?? 0)
+  const installationId = readFileSync(installationPath, 'utf8').trim()
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(installationId)) throw new Error('Invalid installation identity; refusing an unattributed upload.')
+  const coverage = payload.data.metadata?.source === 'ccusage-codex-daily' ? 'retained-local-logs' : 'manual-input'
+  const provenance = { installationId, importerVersion: '0.4.1', coverage, missingLogs: 'unknown', cloudCoverage: 'not-included' }
+  return {
+    ...payload,
+    data: {
+      ...payload.data,
+      metadata: { ...payload.data.metadata, ...provenance },
+      daily: payload.data.daily.map(day => ({
+        ...day,
+        metadata: { ...day.metadata, ...provenance },
+        modelBreakdowns: day.modelBreakdowns.map(model => ({
+          ...model, metadata: { ...model.metadata, ...provenance }
+        }))
+      }))
     }
-  }
-  return snapshot
-}
-
-async function parseSessionFile(
-  filePath: string,
-  sinceEpoch: number | null,
-  sessionsRoot: string
-): Promise<LogEvent | null> {
-  try {
-    let sessionId: string | null = null
-    let sessionTimestamp: string | null = null
-    let cwd: string | null = null
-    let cliVersion: string | null = null
-    let modelName: string | null = null
-    let latestRateLimits: RateLimitsSnapshot | null = null
-    let totals: CodexSessionTotals = {
-      input_tokens: 0,
-      cached_input_tokens: 0,
-      output_tokens: 0,
-      reasoning_output_tokens: 0,
-      total_tokens: 0
-    }
-    let observedUsage = false
-    let malformedLineCount = 0
-
-    const lines = createInterface({
-      input: createReadStream(filePath, { encoding: 'utf8' }),
-      crlfDelay: Infinity
-    })
-
-    for await (const line of lines) {
-      if (!line) continue
-      let entry: any
-      try {
-        entry = JSON.parse(line)
-      } catch {
-        malformedLineCount += 1
-        continue
-      }
-      switch (entry.type) {
-        case 'session_meta':
-          sessionId = entry.payload?.id ?? sessionId
-          sessionTimestamp = entry.payload?.timestamp ?? entry.timestamp ?? sessionTimestamp
-          cwd = entry.payload?.cwd ?? cwd
-          cliVersion = entry.payload?.cli_version ?? cliVersion
-          break
-        case 'turn_context':
-          if (entry.payload?.model) {
-            modelName = entry.payload.model
-          }
-          if (!cwd && entry.payload?.cwd) {
-            cwd = entry.payload.cwd
-          }
-          break
-        case 'event_msg':
-          if (entry.payload?.type === 'token_count') {
-            const info = entry.payload?.info
-            const delta =
-              info?.last_token_usage ??
-              info?.total_token_usage ??
-              null
-            if (delta) {
-              observedUsage = true
-              totals.input_tokens += delta.input_tokens ?? 0
-              totals.cached_input_tokens += delta.cached_input_tokens ?? 0
-              totals.output_tokens += delta.output_tokens ?? 0
-              totals.reasoning_output_tokens += delta.reasoning_output_tokens ?? 0
-              totals.total_tokens += delta.total_tokens ?? 0
-            }
-            if (entry.payload?.rate_limits) {
-              latestRateLimits = normalizeRateLimits(entry.payload.rate_limits)
-            }
-          }
-          break
-      }
-    }
-
-    if (!sessionTimestamp || !observedUsage) {
-      return null
-    }
-
-    const sessionEpoch = Date.parse(sessionTimestamp)
-    if (Number.isNaN(sessionEpoch)) {
-      return null
-    }
-    if (sinceEpoch && sessionEpoch <= sinceEpoch) {
-      return null
-    }
-
-    const metadata: Record<string, unknown> = {
-      codexSessionFile: filePath.replace(sessionsRoot, `~/.codex/${CODEX_SESSIONS_SUBPATH}`)
-    }
-    if (cwd) {
-      metadata.cwd = cwd
-    }
-    if (cliVersion) {
-      metadata.cliVersion = cliVersion
-    }
-    if (sessionId) {
-      metadata.codexSessionId = sessionId
-    }
-    if (latestRateLimits && (latestRateLimits.primary || latestRateLimits.secondary)) {
-      metadata.rateLimits = latestRateLimits
-    }
-    if (malformedLineCount > 0) {
-      metadata.malformedLineCount = malformedLineCount
-    }
-
-    const event: LogEvent = {
-      timestamp: sessionTimestamp,
-      model: modelName ?? 'gpt-5-codex',
-      provider: 'codex',
-      sessionId: sessionId ?? undefined,
-      ide: 'codex-cli',
-      metadata,
-      rateLimits: latestRateLimits ?? undefined,
-      inputTokens: totals.input_tokens,
-      cacheReadTokens: totals.cached_input_tokens,
-      outputTokens: totals.output_tokens,
-      reasoningTokens: totals.reasoning_output_tokens,
-      totalTokens: totals.total_tokens > 0
-        ? totals.total_tokens
-        : totals.input_tokens +
-          totals.cached_input_tokens +
-          totals.output_tokens +
-          totals.reasoning_output_tokens
-    }
-
-    event.cost = estimateCodexCost(event)
-    return event
-  } catch (error) {
-    console.warn(`Failed to parse Codex session file ${filePath}:`, error instanceof Error ? error.message : error)
-    return null
   }
 }
 
 async function uploadUsage(apiBaseUrl: string, payload: UsageRequestPayload, uploadToken?: string) {
   const response = await fetch(new URL('/api/usage', apiBaseUrl), {
     method: 'POST',
+    signal: AbortSignal.timeout(30000),
     headers: {
       'Content-Type': 'application/json',
       ...(uploadToken ? { Authorization: `Bearer ${uploadToken}` } : {})
@@ -1106,6 +648,10 @@ async function uploadUsage(apiBaseUrl: string, payload: UsageRequestPayload, upl
 
   if (!response.ok) {
     throw new Error(`Upload failed (${response.status}): ${JSON.stringify(body)}`)
+  }
+
+  if (body.success === false || body.status === 'failed' || body.status === 'partial_success' || (Array.isArray(body.errors) && body.errors.length > 0)) {
+    throw new Error(`Upload incomplete: ${body.processed ?? 0} records saved. Fix the rejected rows and retry. ${JSON.stringify(body.errors ?? [])}`)
   }
 
   return body
@@ -1125,7 +671,9 @@ async function verifyUploadToken(apiBaseUrl: string, token: string) {
 
 function printPayloadSummary(payload: UsageRequestPayload) {
   const rows = payload.data.daily.reduce((sum, day) => sum + day.modelBreakdowns.length, 0)
-  const totalTokens = payload.data.daily.reduce((sum, day) => sum + (day.totalTokens ?? 0), 0)
+  const totalTokens = payload.data.daily.reduce((sum, day) => sum + day.modelBreakdowns.reduce(
+    (total, model) => total + model.inputTokens + model.outputTokens + (model.cacheCreationTokens ?? 0) + (model.cacheReadTokens ?? 0), 0
+  ), 0)
   const firstDate = payload.data.daily[0]?.date ?? 'n/a'
   const lastDate = payload.data.daily[payload.data.daily.length - 1]?.date ?? 'n/a'
 
@@ -1134,6 +682,8 @@ function printPayloadSummary(payload: UsageRequestPayload) {
   console.log(`Days/sessions: ${payload.data.daily.length}`)
   console.log(`Date range: ${firstDate} -> ${lastDate}`)
   console.log(`Total tokens: ${totalTokens}`)
+  const unpricedRows = payload.data.daily.flatMap(day => day.modelBreakdowns).filter(model => model.metadata?.pricingStatus === 'unknown').length
+  if (unpricedRows) console.log(`Pricing unavailable for ${unpricedRows} model rows. Zero placeholders are not free usage.`)
   console.log('Uploads: token counts, model names, timestamps, optional usage metadata')
   console.log('Does not upload: prompts, responses, source code, file contents, secrets, or environment variables')
 }
@@ -1153,41 +703,9 @@ async function buildPayload(options: CliOptions, provider: Provider): Promise<Us
     ? null
     : await getLastUpdateCursor(apiBaseUrl, auth, provider, verbose)
 
-  let localUsageData: UsageDataPayload | null = null
-  let ccusageData: UsageDataPayload | null = null
-
-  if (fromCodex) {
-    ccusageData = await loadUsageFromCcusage(
-      forceUpload ? null : lastUpdateCursor?.day ?? null,
-      provider,
-      verbose
-    )
-  }
-
-  if (!ccusageData || !ccusageData.daily.length) {
-    localUsageData = fromCodex
-      ? await loadUsageFromCodex(lastUpdateCursor?.timestamp ?? null, verbose)
-      : await loadUsageData(inputPath!, provider)
-
-    if (!localUsageData.daily.length && fromCodex && !forceUpload && command !== 'preview') {
-      console.log('No Codex sessions found after the previous cursor. Replaying full history to stay in sync...')
-      const replayed = await loadUsageFromCodex(null, verbose)
-      localUsageData.daily = replayed.daily
-    }
-  }
-
-  const latestRateLimits = localUsageData ? extractLatestRateLimits(localUsageData) : null
-  if (ccusageData && latestRateLimits && ccusageData.daily.length > 0) {
-    const lastEntry = ccusageData.daily[ccusageData.daily.length - 1]
-    lastEntry.metadata = {
-      ...(lastEntry.metadata || {}),
-      rateLimits: latestRateLimits
-    }
-  }
-
-  const usageData: UsageDataPayload = ccusageData && ccusageData.daily.length > 0
-    ? ccusageData
-    : localUsageData!
+  const usageData = fromCodex
+    ? await loadUsageFromCcusage(forceUpload ? null : lastUpdateCursor?.day ?? null, verbose)
+    : await loadUsageData(inputPath!, provider)
 
   if (!usageData.daily.length) {
     console.log('No daily entries found in input data.')
@@ -1243,6 +761,7 @@ async function runDoctor(options: CliOptions) {
   const config = loadConfig()
   const token = options.uploadToken ?? config.uploadToken
   console.log('Codextime doctor')
+  console.log(`Usage engine: ccusage ${CCUSAGE_VERSION}; Codex entries only; UTC; retained local logs`)
   console.log(`API: ${options.apiBaseUrl}`)
   console.log(`Config: ${existsSync(CODEXTIME_CONFIG_PATH) ? CODEXTIME_CONFIG_PATH : 'not found'}`)
   console.log(`Upload token: ${maskToken(token)}`)
@@ -1275,7 +794,7 @@ async function main() {
     console.log(`Using API base URL: ${options.apiBaseUrl}`)
     console.log(`Provider: ${provider}`)
     console.log(options.fromCodex ? 'Ingesting directly from local Codex session logs.' : `Reading input: ${options.inputPath}`)
-    console.log(`Applying Codex pricing defaults from ${CODEX_PRICING.docsUrl}`)
+    console.log('Pricing uses per-model ccusage estimates; missing prices remain explicitly unknown.')
   }
 
   if (options.command === 'sync' && !options.uploadToken) {
@@ -1295,13 +814,22 @@ async function main() {
     return
   }
 
-  const result = await uploadUsage(options.apiBaseUrl, payload, options.uploadToken)
+  let processed = 0
+  let verificationStatus: string | undefined
+  const today = new Date().toISOString().slice(0, 10)
+  const completed = payload.data.daily.filter(day => day.date.slice(0, 10) < today)
+  if (!completed.length) throw new Error('No completed UTC days to upload. Today remains local until the day closes.')
+  if (completed.length !== payload.data.daily.length) console.log('Open UTC days remain local until the day closes.')
+  const completedPayload = withInstallationProvenance({ ...payload, data: { ...payload.data, daily: completed } })
+  for (const batch of partitionUpload(completedPayload)) {
+    const uploaded = await uploadUsage(options.apiBaseUrl, batch, options.uploadToken)
+    processed += uploaded.processed ?? 0
+    verificationStatus = uploaded.verificationStatus
+  }
+  const result = { processed, verificationStatus }
   console.log(`Upload complete. Processed ${result.processed ?? 0} records.`)
   if (result.verificationStatus) {
     console.log(`Verification: ${result.verificationStatus}`)
-  }
-  if (result.errors && result.errors.length > 0) {
-    console.log('Errors:', result.errors)
   }
 }
 
